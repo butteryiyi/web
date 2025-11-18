@@ -1930,14 +1930,15 @@ class ApplicationCore extends EventEmitter {
   }
 
   // [伪装] 路由、日志、HTML文本修改
-  _createExpressApp() {
+   _createExpressApp() {
     const app = express();
     app.use((req, res, next) => {
       if (
         req.path !== "/api/status" &&
         req.path !== "/" &&
         req.path !== "/favicon.ico" &&
-        req.path !== "/login"
+        req.path !== "/login" &&
+        req.path !== "/logout" // [新增] 忽略登出日志
       ) {
         this.logger.info(
           `[Entrypoint] 收到一个任务: ${req.method} ${req.path}`
@@ -1957,18 +1958,23 @@ class ApplicationCore extends EventEmitter {
         secret: sessionSecret,
         resave: false,
         saveUninitialized: true,
-        cookie: { secure: false, maxAge: 86400000 },
+        cookie: { secure: false, maxAge: 86400000 }, // 注意：在生产环境中如果使用HTTPS，应设为true
       })
     );
+
+    // 中间件：检查用户是否已认证
     const isAuthenticated = (req, res, next) => {
       if (req.session.isAuthenticated) {
         return next();
       }
       res.redirect("/login");
     };
+
+    // 登录页面
     app.get("/login", (req, res) => {
+      // [优化] 如果已经登录，直接跳转到状态页
       if (req.session.isAuthenticated) {
-        return res.redirect("/");
+        return res.redirect("/status");
       }
       const loginHtml = `
       <!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>登录</title>
@@ -1980,21 +1986,40 @@ class ApplicationCore extends EventEmitter {
       }</form></body></html>`;
       res.send(loginHtml);
     });
+
+    // 处理登录请求
     app.post("/login", (req, res) => {
       const { apiKey } = req.body;
       if (apiKey && this.config.apiKeys.includes(apiKey)) {
         req.session.isAuthenticated = true;
-        res.redirect("/");
+        // [修复] 登录成功后重定向到状态/操作页面
+        res.redirect("/status");
       } else {
         res.redirect("/login?error=1");
       }
     });
+
+    // [新增] 登出功能
+    app.get("/logout", (req, res) => {
+        req.session.destroy(err => {
+            if(err) {
+                return res.redirect('/status');
+            }
+            res.clearCookie('connect.sid');
+            res.redirect('/login');
+        });
+    });
     
+    // 根路径路由
     app.get("/", (req, res) => {
-        // isAuthenticated 中间件被移除，因为首页应该对所有人可见
+        // [修复] 如果已登录，直接访问状态页，否则显示首页
+        if (req.session.isAuthenticated) {
+            return res.redirect('/status');
+        }
         res.sendFile(path.join(__dirname, 'index.html'));
     });
 
+    // 状态页面 (现在由 isAuthenticated 中间件保护)
     app.get("/status", isAuthenticated, (req, res) => {
       const { config, requestHandler, authSource, browserManager } = this;
       const initialIndices = authSource.initialIndices || [];
@@ -2040,7 +2065,9 @@ class ApplicationCore extends EventEmitter {
         .action-group { display: flex; flex-wrap: wrap; gap: 15px; align-items: center; }
         .action-group button, .action-group select { font-size: 1em; border: 1px solid #ccc; padding: 10px 15px; border-radius: 8px; cursor: pointer; transition: background-color 0.3s ease; }
         .action-group button:hover { opacity: 0.85; }
-        .action-group button { background-color: #007bff; color: white; border-color: #007bff; }
+        #switch-btn { background-color: #007bff; color: white; border-color: #007bff; }
+        #mode-btn { background-color: #17a2b8; color: white; border-color: #17a2b8; }
+        #logout-btn { background-color: #dc3545; color: white; border-color: #dc3545; margin-left: auto; }
         .action-group select { background-color: #ffffff; color: #000000; -webkit-appearance: none; appearance: none; }
         @media (max-width: 600px) {
             body { 
@@ -2062,6 +2089,7 @@ class ApplicationCore extends EventEmitter {
                 flex-direction: column;
                 align-items: stretch;
             }
+            #logout-btn { margin-left: 0; }
             .action-group select, .action-group button {
                 width: 100%;
                 box-sizing: border-box; 
@@ -2113,8 +2141,9 @@ class ApplicationCore extends EventEmitter {
             <h2>操作面板</h2>
             <div class="action-group">
                 <select id="accountIndexSelect">${accountOptionsHtml}</select>
-                <button onclick="switchSpecificAccount()">切换账号</button>
-                <button onclick="toggleStreamingMode()">切换流模式</button>
+                <button id="switch-btn" onclick="switchSpecificAccount()">切换指定账号</button>
+                <button id="mode-btn" onclick="toggleStreamingMode()">切换流模式</button>
+                <button id="logout-btn" onclick="window.location.href='/logout'">登出</button>
             </div>
         </div>
         </div>
@@ -2151,7 +2180,7 @@ class ApplicationCore extends EventEmitter {
         function switchSpecificAccount() {
             const selectElement = document.getElementById('accountIndexSelect');
             const targetIndex = selectElement.value;
-            if (!confirm(\`确定要切换到账号 #\${targetIndex} 吗？这会重置浏览器会话。\`)) {
+            if (!targetIndex || !confirm(\`确定要切换到账号 #\${targetIndex} 吗？这会重置浏览器会话。\`)) {
                 return;
             }
             fetch('/api/switch-account', {
@@ -2189,8 +2218,7 @@ class ApplicationCore extends EventEmitter {
       res.status(200).send(statusHtml);
     });
 
-
-
+    // API 路由
     app.get("/api/status", isAuthenticated, (req, res) => {
       const { config, requestHandler, authSource, browserManager } = this;
       const initialIndices = authSource.initialIndices || [];
@@ -2251,24 +2279,19 @@ class ApplicationCore extends EventEmitter {
             res.status(400).send(result.reason);
           }
         } else {
-          this.logger.info("[WebUI] 收到手动切换下一个账号的请求...");
-          if (this.authSource.availableIndices.length <= 1) {
-            return res
-              .status(400)
-              .send("切换操作已取消：只有一个可用账号，无法切换。");
-          }
-          const result = await this.requestHandler._switchToNextAuth();
-          if (result.success) {
-            res
-              .status(200)
-              .send(`切换成功！已切换到账号 #${result.newIndex}。`);
-          } else if (result.fallback) {
-            res
-              .status(200)
-              .send(`切换失败，但已成功回退到账号 #${result.newIndex}。`);
-          } else {
-            res.status(409).send(`操作未执行: ${result.reason}`);
-          }
+          // Fallback for old button, though it's removed from UI
+           this.logger.info("[WebUI] 收到手动切换下一个账号的请求...");
+            if (this.authSource.availableIndices.length <= 1) {
+                return res.status(400).send("切换操作已取消：只有一个可用账号，无法切换。");
+            }
+            const result = await this.requestHandler._switchToNextAuth();
+            if (result.success) {
+                res.status(200).send(`切换成功！已切换到账号 #${result.newIndex}。`);
+            } else if (result.fallback) {
+                res.status(200).send(`切换失败，但已成功回退到账号 #${result.newIndex}。`);
+            } else {
+                res.status(409).send(`操作未执行: ${result.reason}`);
+            }
         }
       } catch (error) {
         res
@@ -2288,7 +2311,10 @@ class ApplicationCore extends EventEmitter {
         res.status(400).send('无效模式. 请用 "fake" 或 "real".');
       }
     });
+    
+    // API请求，必须放在认证和页面路由之后
     app.use(this._createAuthMiddleware());
+    
     app.get("/v1/models", (req, res) => {
       const modelIds = this.config.modelList || ["gemini-2.5-pro"];
       const models = modelIds.map((id) => ({
@@ -2305,6 +2331,8 @@ class ApplicationCore extends EventEmitter {
     app.post("/v1/chat/completions", (req, res) => {
       this.requestHandler.processOpenAIRequest(req, res);
     });
+    
+    // 捕获所有其他请求
     app.all(/(.*)/, (req, res) => {
       this.requestHandler.processRequest(req, res);
     });
