@@ -45,7 +45,9 @@ jobs:
         with:
           # 使用上一步确定的标签
           ref: ${{ steps.get_tag.outputs.tag }}
-
+          # !!! 新增这一行 !!!
+          # 值为 0 表示获取所有历史和标签，以便 metadata-action 能够正确识别版本。
+          fetch-depth: 0
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
